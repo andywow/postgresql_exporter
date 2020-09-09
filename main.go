@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,18 +12,15 @@ import (
 	"sync"
 	"time"
 
+	//Required for debugging
+	//_ "net/http/pprof"
+
 	"github.com/BurntSushi/toml"
-
 	_ "github.com/mattn/go-oci8"
-
-	"fmt"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"gopkg.in/alecthomas/kingpin.v2"
-	//Required for debugging
-	//_ "net/http/pprof"
 )
 
 var (
@@ -44,7 +42,7 @@ const (
 	exporter  = "exporter"
 )
 
-// Metrics object description
+// Metric object description
 type Metric struct {
 	Context          string
 	Labels           []string
@@ -130,7 +128,7 @@ func NewExporter(dsn string) *Exporter {
 			Subsystem: exporter,
 			Name:      "scrape_errors_total",
 			Help:      "Total number of times an error occured scraping a Oracle database.",
-		}, []string{"collector"}),
+		}, []string{"collector", "code"}),
 		error: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: exporter,
@@ -212,16 +210,16 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		log.Debugln("Successfully pinged Oracle database: ")
 		e.up.Set(1)
 	}
-	
+
 	wg := sync.WaitGroup{}
 
 	for _, metric := range metricsToScrap.Metric {
 		wg.Add(1)
-		metric := metric  //https://golang.org/doc/faq#closures_and_goroutines
-		
+		metric := metric //https://golang.org/doc/faq#closures_and_goroutines
+
 		go func() {
 			defer wg.Done()
-			
+
 			log.Debugln("About to scrape metric: ")
 			log.Debugln("- Metric MetricsDesc: ", metric.MetricsDesc)
 			log.Debugln("- Metric Context: ", metric.Context)
@@ -233,17 +231,21 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 			if len(metric.Request) == 0 {
 				log.Errorln("Error scraping for ", metric.MetricsDesc, ". Did you forget to define request in your toml file?")
-				continue
+				return
 			}
 
 			if len(metric.MetricsDesc) == 0 {
 				log.Errorln("Error scraping for query", metric.Request, ". Did you forget to define metricsdesc  in your toml file?")
-				continue
+				return
 			}
 
 			if err = ScrapeMetric(e.db, ch, metric); err != nil {
 				log.Errorln("Error scraping for", metric.Context, "_", metric.MetricsDesc, ":", err)
-				e.scrapeErrors.WithLabelValues(metric.Context).Inc()
+				if err != nil {
+					e.scrapeErrors.WithLabelValues(metric.Context, err.Error()).Inc()
+				} else {
+					e.scrapeErrors.WithLabelValues(metric.Context, "empty error").Inc()
+				}
 			} else {
 				log.Debugln("Successfully scrapped metric: ", metric.Context)
 			}
