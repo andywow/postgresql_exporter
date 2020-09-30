@@ -1,47 +1,25 @@
-VERSION        ?= 0.2.5
-ORACLE_VERSION ?= 18.5
+VERSION        ?= 0.0.1
 LDFLAGS        := -X main.Version=$(VERSION)
 GOFLAGS        := -ldflags "$(LDFLAGS) -s -w"
 ARCH           ?= $(shell uname -m)
 GOARCH         ?= $(subst x86_64,amd64,$(patsubst i%86,386,$(ARCH)))
-RPM_VERSION    ?= $(ORACLE_VERSION).0.0.0-3
-ORA_RPM         = oracle-instantclient$(ORACLE_VERSION)-devel-$(RPM_VERSION).$(ARCH).rpm oracle-instantclient$(ORACLE_VERSION)-basic-$(RPM_VERSION).$(ARCH).rpm
-LD_LIBRARY_PATH = /usr/lib/oracle/$(ORACLE_VERSION)/client64/lib
-BUILD_ARGS      = --build-arg VERSION=$(VERSION) --build-arg ORACLE_VERSION=$(ORACLE_VERSION)
-DIST_DIR        = oracledb_exporter.$(VERSION)-ora$(ORACLE_VERSION).linux-${GOARCH}
-ARCHIVE         = oracledb_exporter.$(VERSION)-ora$(ORACLE_VERSION).linux-${GOARCH}.tar.gz
+BUILD_ARGS      = --build-arg VERSION=$(VERSION)
+DIST_DIR        = postgresql_exporter.$(VERSION).linux-${GOARCH}
+ARCHIVE         = postgresql_exporter.$(VERSION).linux-${GOARCH}.tar.gz
 
-export LD_LIBRARY_PATH ORACLE_VERSION
-
-%.rpm:
-	wget -q http://yum.oracle.com/repo/OracleLinux/OL7/oracle/instantclient/$(ARCH)/getPackage/$@
-
-download-rpms: $(ORA_RPM)
-
-prereq: download-rpms
-	@echo deps
-	sudo apt-get update
-	sudo apt-get install --no-install-recommends -qq libaio1 rpm
-	sudo rpm -Uvh --nodeps --force oracle*rpm
-	echo $(LD_LIBRARY_PATH) | sudo tee /etc/ld.so.conf.d/oracle.conf
-	sudo ldconfig
-
-oci.pc:
-	sed "s/@ORACLE_VERSION@/$(ORACLE_VERSION)/g" oci8.pc.template > oci8.pc
-
-linux: oci.pc
+linux:
 	@echo build linux
 	mkdir -p ./dist/$(DIST_DIR)
-	PKG_CONFIG_PATH=${PWD} GOOS=linux go build $(GOFLAGS) -o ./dist/$(DIST_DIR)/oracledb_exporter
+	PKG_CONFIG_PATH=${PWD} GOOS=linux go build $(GOFLAGS) -o ./dist/$(DIST_DIR)/postgresql_exporter
 	cp default-metrics.toml ./dist/$(DIST_DIR)
 	(cd dist ; tar cfz $(ARCHIVE) $(DIST_DIR))
 
-darwin: oci.pc
+darwin:
 	@echo build darwin
-	mkdir -p ./dist/oracledb_exporter.$(VERSION).darwin-${GOARCH}
-	PKG_CONFIG_PATH=${PWD} GOOS=darwin go build $(GOFLAGS) -o ./dist/oracledb_exporter.$(VERSION).darwin-${GOARCH}/oracledb_exporter
-	cp default-metrics.toml ./dist/oracledb_exporter.$(VERSION).darwin-${GOARCH}
-	(cd dist ; tar cfz oracledb_exporter.$(VERSION).darwin-${GOARCH}.tar.gz oracledb_exporter.$(VERSION).darwin-${GOARCH})
+	mkdir -p ./dist/postgresql_exporter.$(VERSION).darwin-${GOARCH}
+	PKG_CONFIG_PATH=${PWD} GOOS=darwin go build $(GOFLAGS) -o ./dist/postgresql_exporter.$(VERSION).darwin-${GOARCH}/postgresql_exporter
+	cp default-metrics.toml ./dist/postgresql_exporter.$(VERSION).darwin-${GOARCH}
+	(cd dist ; tar cfz postgresql_exporter.$(VERSION).darwin-${GOARCH}.tar.gz postgresql_exporter.$(VERSION).darwin-${GOARCH})
 
 local-build:  linux
 
@@ -77,7 +55,7 @@ alpine-image: $(ORA_RPM) sgerrand.rsa.pub glibc-2.29-r0.apk
 	docker build -f alpine/Dockerfile $(BUILD_ARGS) -t "iamseth/oracledb_exporter:$(VERSION)-alpine" .
 	docker tag "iamseth/oracledb_exporter:$(VERSION)-alpine" "iamseth/oracledb_exporter:alpine"
 
-travis: oci.pc prereq deps test linux
+travis: deps test linux
 	@true
 
 .PHONY: build deps test clean docker travis oci.pc

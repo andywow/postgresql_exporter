@@ -1,4 +1,4 @@
-module github.com/andywow/oracledb_exporter
+module github.com/andywow/postgres_exporter
 
 go 1.14
 
@@ -6,6 +6,8 @@ require (
 	github.com/BurntSushi/toml v0.3.1
 	github.com/beorn7/perks v1.0.1
 	github.com/golang/protobuf v1.4.2
+	github.com/jackc/pgx v3.6.2+incompatible
+	github.com/jmoiron/sqlx v1.2.0
 	github.com/mattn/go-oci8 v0.0.8
 	github.com/matttproud/golang_protobuf_extensions v1.0.1
 	github.com/prometheus/client_golang v1.7.1
