@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
-	"fmt"
+	"hash"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -11,16 +14,18 @@ import (
 	"sync"
 	"time"
 
-	//Required for debugging
-	//_ "net/http/pprof"
-
 	"github.com/BurntSushi/toml"
 	_ "github.com/jackc/pgx/stdlib"
 	"github.com/jmoiron/sqlx"
+
+	"fmt"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"gopkg.in/alecthomas/kingpin.v2"
+	//Required for debugging
+	//_ "net/http/pprof"
 )
 
 var (
@@ -28,12 +33,14 @@ var (
 	Version            = "0.0.0.dev"
 	listenAddress      = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry. (env: LISTEN_ADDRESS)").Default(getEnv("LISTEN_ADDRESS", ":9161")).String()
 	metricPath         = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics. (env: TELEMETRY_PATH)").Default(getEnv("TELEMETRY_PATH", "/metrics")).String()
-	landingPage        = []byte("<html><head><title>PostreSQL DB Exporter " + Version + "</title></head><body><h1>PostreSQL DB Exporter " + Version + "</h1><p><a href='" + *metricPath + "'>Metrics</a></p></body></html>")
 	defaultFileMetrics = kingpin.Flag("default.metrics", "File with default metrics in a TOML file. (env: DEFAULT_METRICS)").Default(getEnv("DEFAULT_METRICS", "default-metrics.toml")).String()
 	customMetrics      = kingpin.Flag("custom.metrics", "File that may contain various custom metrics in a TOML file. (env: CUSTOM_METRICS)").Default(getEnv("CUSTOM_METRICS", "")).String()
 	queryTimeout       = kingpin.Flag("query.timeout", "Query timeout (in seconds). (env: QUERY_TIMEOUT)").Default(getEnv("QUERY_TIMEOUT", "5")).String()
 	maxIdleConns       = kingpin.Flag("database.maxIdleConns", "Number of maximum idle connections in the connection pool. (env: DATABASE_MAXIDLECONNS)").Default(getEnv("DATABASE_MAXIDLECONNS", "0")).Int()
 	maxOpenConns       = kingpin.Flag("database.maxOpenConns", "Number of maximum open connections in the connection pool. (env: DATABASE_MAXOPENCONNS)").Default(getEnv("DATABASE_MAXOPENCONNS", "10")).Int()
+	securedMetrics     = kingpin.Flag("web.secured-metrics", "Expose metrics using https.").Default("false").Bool()
+	serverCert         = kingpin.Flag("web.ssl-server-cert", "Path to the PEM encoded certificate").ExistingFile()
+	serverKey          = kingpin.Flag("web.ssl-server-key", "Path to the PEM encoded key").ExistingFile()
 )
 
 // Metric name parts.
@@ -48,6 +55,7 @@ type Metric struct {
 	Labels           []string
 	MetricsDesc      map[string]string
 	MetricsType      map[string]string
+	MetricsBuckets   map[string]map[string]string
 	FieldToAppend    string
 	Request          string
 	IgnoreZeroResult bool
@@ -62,6 +70,7 @@ type Metrics struct {
 var (
 	metricsToScrap    Metrics
 	additionalMetrics Metrics
+	hashMap           map[int][]byte
 )
 
 // Exporter collects PostgreSQL DB metrics. It implements prometheus.Collector.
@@ -211,6 +220,10 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		e.up.Set(1)
 	}
 
+	if checkIfMetricsChanged() {
+		reloadMetrics()
+	}
+
 	wg := sync.WaitGroup{}
 
 	for _, metric := range metricsToScrap.Metric {
@@ -224,6 +237,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			log.Debugln("- Metric MetricsDesc: ", metric.MetricsDesc)
 			log.Debugln("- Metric Context: ", metric.Context)
 			log.Debugln("- Metric MetricsType: ", metric.MetricsType)
+			log.Debugln("- Metric MetricsBuckets: ", metric.MetricsBuckets, "(Ignored unless Histogram type)")
 			log.Debugln("- Metric Labels: ", metric.Labels)
 			log.Debugln("- Metric FieldToAppend: ", metric.FieldToAppend)
 			log.Debugln("- Metric IgnoreZeroResult: ", metric.IgnoreZeroResult)
@@ -239,6 +253,17 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 				return
 			}
 
+			for column, metricType := range metric.MetricsType {
+				if metricType == "histogram" {
+					_, ok := metric.MetricsBuckets[column]
+					if !ok {
+						log.Errorln("Unable to find MetricsBuckets configuration key for metric. (metric=" + column + ")")
+						return
+					}
+				}
+			}
+
+			scrapeStart := time.Now()
 			if err = ScrapeMetric(e.db, ch, metric); err != nil {
 				log.Errorln("Error scraping for", metric.Context, "_", metric.MetricsDesc, ":", err)
 				if err != nil {
@@ -247,7 +272,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 					e.scrapeErrors.WithLabelValues(metric.Context, "empty error").Inc()
 				}
 			} else {
-				log.Debugln("Successfully scrapped metric: ", metric.Context)
+				log.Debugln("Successfully scraped metric: ", metric.Context, metric.MetricsDesc, time.Since(scrapeStart))
 			}
 		}()
 	}
@@ -256,8 +281,9 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 
 func GetMetricType(metricType string, metricsType map[string]string) prometheus.ValueType {
 	var strToPromType = map[string]prometheus.ValueType{
-		"gauge":   prometheus.GaugeValue,
-		"counter": prometheus.CounterValue,
+		"gauge":     prometheus.GaugeValue,
+		"counter":   prometheus.CounterValue,
+		"histogram": prometheus.UntypedValue,
 	}
 
 	strType, ok := metricsType[strings.ToLower(metricType)]
@@ -275,14 +301,14 @@ func GetMetricType(metricType string, metricsType map[string]string) prometheus.
 func ScrapeMetric(db *sqlx.DB, ch chan<- prometheus.Metric, metricDefinition Metric) error {
 	log.Debugln("Calling function ScrapeGenericValues()")
 	return ScrapeGenericValues(db, ch, metricDefinition.Context, metricDefinition.Labels,
-		metricDefinition.MetricsDesc, metricDefinition.MetricsType,
+		metricDefinition.MetricsDesc, metricDefinition.MetricsType, metricDefinition.MetricsBuckets,
 		metricDefinition.FieldToAppend, metricDefinition.IgnoreZeroResult,
 		metricDefinition.Request)
 }
 
 // generic method for retrieving metrics.
 func ScrapeGenericValues(db *sqlx.DB, ch chan<- prometheus.Metric, context string, labels []string,
-	metricsDesc map[string]string, metricsType map[string]string, fieldToAppend string, ignoreZeroResult bool, request string) error {
+	metricsDesc map[string]string, metricsType map[string]string, metricsBuckets map[string]map[string]string, fieldToAppend string, ignoreZeroResult bool, request string) error {
 	metricsCount := 0
 	genericParser := func(row map[string]string) error {
 		// Construct labels value
@@ -307,7 +333,33 @@ func ScrapeGenericValues(db *sqlx.DB, ch chan<- prometheus.Metric, context strin
 					metricHelp,
 					labels, nil,
 				)
-				ch <- prometheus.MustNewConstMetric(desc, GetMetricType(metric, metricsType), value, labelsValues...)
+				if metricsType[strings.ToLower(metric)] == "histogram" {
+					count, err := strconv.ParseUint(strings.TrimSpace(row["count"]), 10, 64)
+					if err != nil {
+						log.Errorln("Unable to convert count value to int (metric=" + metric +
+							",metricHelp=" + metricHelp + ",value=<" + row["count"] + ">)")
+						continue
+					}
+					buckets := make(map[float64]uint64)
+					for field, le := range metricsBuckets[metric] {
+						lelimit, err := strconv.ParseFloat(strings.TrimSpace(le), 64)
+						if err != nil {
+							log.Errorln("Unable to convert bucket limit value to float (metric=" + metric +
+								",metricHelp=" + metricHelp + ",bucketlimit=<" + le + ">)")
+							continue
+						}
+						counter, err := strconv.ParseUint(strings.TrimSpace(row[field]), 10, 64)
+						if err != nil {
+							log.Errorln("Unable to convert ", field, " value to int (metric="+metric+
+								",metricHelp="+metricHelp+",value=<"+row[field]+">)")
+							continue
+						}
+						buckets[lelimit] = counter
+					}
+					ch <- prometheus.MustNewConstHistogram(desc, count, value, buckets, labelsValues...)
+				} else {
+					ch <- prometheus.MustNewConstMetric(desc, GetMetricType(metric, metricsType), value, labelsValues...)
+				}
 				// If no labels, use metric name
 			} else {
 				desc := prometheus.NewDesc(
@@ -315,7 +367,33 @@ func ScrapeGenericValues(db *sqlx.DB, ch chan<- prometheus.Metric, context strin
 					metricHelp,
 					nil, nil,
 				)
-				ch <- prometheus.MustNewConstMetric(desc, GetMetricType(metric, metricsType), value)
+				if metricsType[strings.ToLower(metric)] == "histogram" {
+					count, err := strconv.ParseUint(strings.TrimSpace(row["count"]), 10, 64)
+					if err != nil {
+						log.Errorln("Unable to convert count value to int (metric=" + metric +
+							",metricHelp=" + metricHelp + ",value=<" + row["count"] + ">)")
+						continue
+					}
+					buckets := make(map[float64]uint64)
+					for field, le := range metricsBuckets[metric] {
+						lelimit, err := strconv.ParseFloat(strings.TrimSpace(le), 64)
+						if err != nil {
+							log.Errorln("Unable to convert bucket limit value to float (metric=" + metric +
+								",metricHelp=" + metricHelp + ",bucketlimit=<" + le + ">)")
+							continue
+						}
+						counter, err := strconv.ParseUint(strings.TrimSpace(row[field]), 10, 64)
+						if err != nil {
+							log.Errorln("Unable to convert ", field, " value to int (metric="+metric+
+								",metricHelp="+metricHelp+",value=<"+row[field]+">)")
+							continue
+						}
+						buckets[lelimit] = counter
+					}
+					ch <- prometheus.MustNewConstHistogram(desc, count, value, buckets)
+				} else {
+					ch <- prometheus.MustNewConstMetric(desc, GetMetricType(metric, metricsType), value)
+				}
 			}
 			metricsCount++
 		}
@@ -398,14 +476,43 @@ func cleanName(s string) string {
 	return s
 }
 
-func main() {
-	log.AddFlags(kingpin.CommandLine)
-	kingpin.Version("postgresql_exporter " + Version)
-	kingpin.HelpFlag.Short('h')
-	kingpin.Parse()
+func hashFile(h hash.Hash, fn string) error {
+	f, err := os.Open(fn)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	return nil
+}
 
-	log.Infoln("Starting postgresql_exporter " + Version)
-	dsn := os.Getenv("DATA_SOURCE_NAME")
+func checkIfMetricsChanged() bool {
+	for i, _customMetrics := range strings.Split(*customMetrics, ",") {
+		if len(_customMetrics) == 0 {
+			continue
+		}
+		log.Debug("Checking modifications in following metrics definition file:", _customMetrics)
+		h := sha256.New()
+		if err := hashFile(h, _customMetrics); err != nil {
+			log.Errorln("Unable to get file hash", err)
+			return false
+		}
+		// If any of files has been changed reload metrics
+		if !bytes.Equal(hashMap[i], h.Sum(nil)) {
+			log.Infoln(_customMetrics, "has been changed. Reloading metrics...")
+			hashMap[i] = h.Sum(nil)
+			return true
+		}
+	}
+	return false
+}
+
+func reloadMetrics() {
+	// Truncate metricsToScrap
+	metricsToScrap.Metric = []Metric{}
+
 	// Load default metrics
 	if _, err := toml.DecodeFile(*defaultFileMetrics, &metricsToScrap); err != nil {
 		log.Errorln(err)
@@ -416,26 +523,63 @@ func main() {
 
 	// If custom metrics, load it
 	if strings.Compare(*customMetrics, "") != 0 {
-		if _, err := toml.DecodeFile(*customMetrics, &additionalMetrics); err != nil {
-			log.Errorln(err)
-			panic(errors.New("Error while loading " + *customMetrics))
-		} else {
-			log.Infoln("Successfully loaded custom metrics from: " + *customMetrics)
+		for _, _customMetrics := range strings.Split(*customMetrics, ",") {
+			if _, err := toml.DecodeFile(_customMetrics, &additionalMetrics); err != nil {
+				log.Errorln(err)
+				panic(errors.New("Error while loading " + _customMetrics))
+			} else {
+				log.Infoln("Successfully loaded custom metrics from: " + _customMetrics)
+			}
+			metricsToScrap.Metric = append(metricsToScrap.Metric, additionalMetrics.Metric...)
 		}
-
-		metricsToScrap.Metric = append(metricsToScrap.Metric, additionalMetrics.Metric...)
 	} else {
 		log.Infoln("No custom metrics defined.")
 	}
+}
+
+func main() {
+	log.AddFlags(kingpin.CommandLine)
+	kingpin.Version("postgresql_exporter " + Version)
+	kingpin.HelpFlag.Short('h')
+	kingpin.Parse()
+
+	log.Infoln("Starting postgresql_exporter " + Version)
+	dsn := os.Getenv("DATA_SOURCE_NAME")
+
+	// Load default and custom metrics
+	hashMap = make(map[int][]byte)
+	reloadMetrics()
+
 	exporter := NewExporter(dsn)
 	prometheus.MustRegister(exporter)
-	http.Handle(*metricPath, promhttp.Handler())
+
+	// See more info on https://github.com/prometheus/client_golang/blob/master/prometheus/promhttp/http.go#L269
+	opts := promhttp.HandlerOpts{
+		ErrorLog:      log.NewErrorLogger(),
+		ErrorHandling: promhttp.ContinueOnError,
+	}
+	http.Handle(*metricPath, promhttp.HandlerFor(prometheus.DefaultGatherer, opts))
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, err := w.Write(landingPage)
-		if err != nil {
-			log.Error(err)
-		}
+		w.Write([]byte("<html><head><title>PostgreSQL DB Exporter " + Version + "</title></head><body><h1>PostgreSQL DB Exporter " + Version + "</h1><p><a href='" + *metricPath + "'>Metrics</a></p></body></html>"))
 	})
-	log.Infoln("Listening on", *listenAddress)
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+
+	if *securedMetrics {
+		if _, err := os.Stat(*serverCert); err != nil {
+			log.Fatal("Error loading certificate:", err)
+			panic(err)
+		}
+		if _, err := os.Stat(*serverKey); err != nil {
+			log.Fatal("Error loading key:", err)
+			panic(err)
+		}
+		log.Infoln("Listening TLS server on", *listenAddress)
+		if err := http.ListenAndServeTLS(*listenAddress, *serverCert, *serverKey, nil); err != nil {
+			log.Fatal("Failed to start the secure server:", err)
+			panic(err)
+		}
+	} else {
+		log.Infoln("Listening on", *listenAddress)
+		log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	}
 }
